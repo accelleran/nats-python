@@ -3,6 +3,8 @@ import json
 import re
 import socket
 import ssl
+import select
+import time
 from dataclasses import dataclass
 from typing import BinaryIO, Callable, Dict, Match, Optional, Pattern, Tuple, Union
 from urllib.parse import urlparse
@@ -169,7 +171,6 @@ class NATSClient:
         if self._socket_options["keepalive"]:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
-        sock.settimeout(self._socket_options["timeout"])
         sock.connect((self._conn_options.hostname, self._conn_options.port))
 
         self._socket_file = sock.makefile("rb")
@@ -290,10 +291,16 @@ class NATSClient:
 
         return reply_messages[sub.sid]
 
-    def wait(self, *, count=None) -> None:
+    def wait(self, *, count=None, timeout: float = None) -> None:
         total = 0
+        deadline = None
+        inner_timeout = None
+        if timeout is not None:
+            deadline = time.time() + timeout
         while True:
-            command, result = self._recv(MSG_RE, PING_RE, OK_RE)
+            if deadline is not None:
+                inner_timeout = deadline - time.time()
+            command, result = self._recv(MSG_RE, PING_RE, OK_RE, timeout=inner_timeout)
             if command is MSG_RE:
                 self._handle_message(result)
 
@@ -334,7 +341,19 @@ class NATSClient:
 
         raise RuntimeError(f"got unsupported type for encoding: type={type(value)}")
 
-    def _recv(self, *commands: Pattern[bytes]) -> Tuple[Pattern[bytes], Match[bytes]]:
+    def _recv(self, *commands: Pattern[bytes], timeout: float = None) -> Tuple[Pattern[bytes], Match[bytes]]:
+        if timeout is None:
+            timeout = self._socket_options["timeout"]
+
+        if timeout is not None:
+            deadline = time.time() + timeout
+            if deadline is not None:
+                self._socket.setblocking(False)
+                if len(select.select([self._socket], [], [], deadline - time.time())[0]) == 0:
+                    self._socket.setblocking(True)
+                    # Timed out
+                    raise socket.timeout
+                self._socket.setblocking(True)
         line = self._readline()
 
         command = self._get_command(line)
